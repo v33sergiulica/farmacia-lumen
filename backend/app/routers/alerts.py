@@ -9,39 +9,54 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query
 
 from ..config import settings
-from ..db import get_db, query_all, query_one
+from ..db import get_db, query_all
 from ..schemas import AlertCounts, AlertItem, AlertsResponse
+from ..services.cache import cached_call, make_cache_key
 from ..services.filters import (
     GlobalFilters,
-    build_sales_where,
     compute_targets,
     get_global_filters,
-    sales_joins_sql,
 )
+from .customers import get_customers
 from .inventory import get_inventory
 from .promotions import get_promotions
-from .stores import get_stores
+from .stores import fetch_store_month_agg, get_stores
 
 router = APIRouter(tags=["alerts"])
 
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
-@router.get("/alerts", response_model=AlertsResponse)
-def get_alerts(
-    severity: Literal["critical", "high", "medium", "low"] | None = Query(default=None),
-    category: Literal[
-        "store_performance", "promotions", "inventory", "loyalty", "data_hygiene"
-    ]
-    | None = Query(default=None),
-    filters: GlobalFilters = Depends(get_global_filters),
-    conn: sqlite3.Connection = Depends(get_db),
-) -> AlertsResponse:
+def _compute_all_alerts(filters: GlobalFilters, conn: sqlite3.Connection) -> list[AlertItem]:
     alerts: list[AlertItem] = []
 
+    sm_rows = fetch_store_month_agg(conn, filters)
     stores_data = get_stores(sort_by="attainment_pct", filters=filters, conn=conn)
     promos_data = get_promotions(filters=filters, conn=conn)
     inv_data = get_inventory(low_stock_max=5, limit=25, filters=filters, conn=conn)
+    cust_data = get_customers(filters=filters, conn=conn)
+
+    # Index store-month rows in memory (<= 364 rows)
+    by_store_months: dict[int, list[dict[str, object]]] = {}
+    monthly_rev_totals: dict[str, float] = {}
+    for r in sm_rows:
+        sid = int(r["id_magazin"])
+        luna = str(r["luna"])
+        rev = float(r["rev"])
+        by_store_months.setdefault(sid, []).append(r)
+        monthly_rev_totals[luna] = monthly_rev_totals.get(luna, 0.0) + rev
+
+    # Per-store monthly targets when target_available
+    store_month_targets: dict[tuple[int, str], float] = {}
+    if stores_data.target_available:
+        t_rows = query_all(
+            conn,
+            "SELECT id_magazin, luna, target_vanzari FROM target_lunar",
+        )
+        store_month_targets = {
+            (int(r["id_magazin"]), str(r["luna"])): float(r["target_vanzari"])
+            for r in t_rows
+        }
 
     # 1. Sustained Store Underperformance (Critical)
     total_chain_shortfall = sum(
@@ -54,34 +69,19 @@ def get_alerts(
             and st.attainment_pct < 82.0
             and st.variance_ron is not None
         ):
-            # Dynamically detect inflection month from monthly series
-            m_rows = query_all(
-                conn,
-                """
-                SELECT substr(b.cand, 1, 7) AS luna,
-                       ROUND(SUM(v.valoare_fara_tva), 2) AS rev,
-                       t.target_vanzari AS tgt
-                FROM bonuri b
-                JOIN vanzari v ON v.id_bon = b.id
-                LEFT JOIN target_lunar t ON t.id_magazin = b.id_magazin AND t.luna = substr(b.cand, 1, 7)
-                WHERE b.id_magazin = ? AND b.cand >= ? AND b.cand < ?
-                GROUP BY 1
-                ORDER BY 1
-                """,
-                (st.id, filters.start_ts, filters.end_ts_excl),
-            )
+            m_rows = by_store_months.get(st.id, [])
             inflection_note = ""
             if len(m_rows) >= 6:
                 for idx in range(2, len(m_rows) - 2):
                     pre = [
-                        100.0 * r["rev"] / r["tgt"]
+                        100.0 * float(r["rev"]) / store_month_targets[(st.id, str(r["luna"]))]
                         for r in m_rows[:idx]
-                        if r["tgt"] and r["tgt"] > 0
+                        if store_month_targets.get((st.id, str(r["luna"])), 0.0) > 0
                     ]
                     post = [
-                        100.0 * r["rev"] / r["tgt"]
+                        100.0 * float(r["rev"]) / store_month_targets[(st.id, str(r["luna"]))]
                         for r in m_rows[idx:]
-                        if r["tgt"] and r["tgt"] > 0
+                        if store_month_targets.get((st.id, str(r["luna"])), 0.0) > 0
                     ]
                     if pre and post and (sum(pre) / len(pre)) >= 90.0 and (sum(post) / len(post)) < 75.0:
                         inflection_note = (
@@ -119,73 +119,53 @@ def get_alerts(
             )
 
     # 2. Single-Store Multi-Day Outages (High)
-    where_sql, params, _, needs_prod, needs_cat = build_sales_where(filters)
-    joins_sql = sales_joins_sql(False, needs_prod, needs_cat)
-    outage_months = query_all(
-        conn,
-        f"""
-        WITH sm AS (
-            SELECT b.id_magazin, m.nume, m.id_regiune, substr(b.cand, 1, 7) AS luna,
-                   ROUND(SUM(v.valoare_fara_tva), 2) AS rev
-            FROM bonuri b
-            JOIN vanzari v ON v.id_bon = b.id
-            JOIN magazine m ON m.id = b.id_magazin
-            {joins_sql}
-            WHERE {where_sql}
-            GROUP BY b.id_magazin, substr(b.cand, 1, 7)
-        ),
-        sm_lag AS (
-            SELECT sm.*, t.target_vanzari AS tgt,
-                   LAG(sm.rev) OVER (PARTITION BY sm.id_magazin ORDER BY sm.luna) AS prev_rev
-            FROM sm
-            LEFT JOIN target_lunar t ON t.id_magazin = sm.id_magazin AND t.luna = sm.luna
-        )
-        SELECT id_magazin, nume, luna, rev, prev_rev, tgt
-        FROM sm_lag
-        WHERE prev_rev > 0 AND (rev - prev_rev) / prev_rev < -0.50
-          AND (tgt IS NULL OR (100.0 * rev / tgt) < 50.0)
-        """,
-        params,
-    )
-    for om in outage_months:
-        sid = int(om["id_magazin"])
-        luna = om["luna"]
-        d_rows = query_all(
-            conn,
-            "SELECT DISTINCT substr(cand, 1, 10) AS d FROM bonuri WHERE id_magazin = ? AND substr(cand, 1, 7) = ? ORDER BY 1",
-            (sid, luna),
-        )
-        max_gap = 0
-        gap_span = ""
-        days = [date.fromisoformat(r["d"]) for r in d_rows]
-        for idx in range(1, len(days)):
-            g = (days[idx] - days[idx - 1]).days - 1
-            if g > max_gap:
-                max_gap = g
-                gap_span = f"{days[idx - 1]} to {days[idx]}"
-        est_loss = round(max(0.0, float(om["prev_rev"]) - float(om["rev"])), 2)
-        mom_pct = 100.0 * (float(om["rev"]) - float(om["prev_rev"])) / float(om["prev_rev"])
-        alerts.append(
-            AlertItem(
-                id=f"store-outage-{sid}-{luna}",
-                severity="high",
-                category="store_performance",
-                title=f"Operating Outage at {om['nume']} ({luna})",
-                metric_highlight=f"{mom_pct:.1f}% MoM | {max_gap} zero-sale days",
-                ron_impact=est_loss,
-                affected_entities=[om["nume"]],
-                evidence=(
-                    f"{om['nume']} dropped from {om['prev_rev']:,.0f} RON to {om['rev']:,.0f} RON in {luna} "
-                    f"({mom_pct:.1f}% MoM), with {len(days)} active days and a {max_gap}-day gap ({gap_span})."
-                ),
-                recommended_action=(
-                    "Log root cause (renovation, POS/IT outage, or emergency closure) in historical reporting "
-                    "and adjust YoY/monthly benchmarks for that period."
-                ),
-                drilldown_path="/stores",
-                drilldown_filters={"store_id": sid},
-            )
-        )
+    store_name_map = {s.id: s.nume for s in stores_data.stores}
+    for sid, m_rows in by_store_months.items():
+        for idx in range(1, len(m_rows)):
+            prev_rev = float(m_rows[idx - 1]["rev"])
+            rev = float(m_rows[idx]["rev"])
+            luna = str(m_rows[idx]["luna"])
+            tgt = store_month_targets.get((sid, luna))
+            if prev_rev > 0 and (rev - prev_rev) / prev_rev < -0.50 and (
+                tgt is None or (100.0 * rev / tgt) < 50.0
+            ):
+                d_rows = query_all(
+                    conn,
+                    "SELECT DISTINCT substr(cand, 1, 10) AS d FROM bonuri WHERE id_magazin = ? AND cand >= ? AND cand < ? ORDER BY 1",
+                    (sid, f"{luna}-01 00:00:00", f"{luna}-32"),
+                )
+                max_gap = 0
+                gap_span = ""
+                days = [date.fromisoformat(r["d"]) for r in d_rows]
+                for d_idx in range(1, len(days)):
+                    g = (days[d_idx] - days[d_idx - 1]).days - 1
+                    if g > max_gap:
+                        max_gap = g
+                        gap_span = f"{days[d_idx - 1]} to {days[d_idx]}"
+                est_loss = round(max(0.0, prev_rev - rev), 2)
+                mom_pct = 100.0 * (rev - prev_rev) / prev_rev
+                s_name = store_name_map.get(sid, f"Store {sid}")
+                alerts.append(
+                    AlertItem(
+                        id=f"store-outage-{sid}-{luna}",
+                        severity="high",
+                        category="store_performance",
+                        title=f"Operating Outage at {s_name} ({luna})",
+                        metric_highlight=f"{mom_pct:.1f}% MoM | {max_gap} zero-sale days",
+                        ron_impact=est_loss,
+                        affected_entities=[s_name],
+                        evidence=(
+                            f"{s_name} dropped from {prev_rev:,.0f} RON to {rev:,.0f} RON in {luna} "
+                            f"({mom_pct:.1f}% MoM), with {len(days)} active days and a {max_gap}-day gap ({gap_span})."
+                        ),
+                        recommended_action=(
+                            "Log root cause (renovation, POS/IT outage, or emergency closure) in historical reporting "
+                            "and adjust YoY/monthly benchmarks for that period."
+                        ),
+                        drilldown_path="/stores",
+                        drilldown_filters={"store_id": sid},
+                    )
+                )
 
     # 3 & 4. Net-Loss and Margin-Eroding Promotions
     for c in promos_data.campaigns:
@@ -303,26 +283,12 @@ def get_alerts(
         )
 
     # 7. Systemic Target Calibration Bias (Medium)
-    loy_where, loy_params, l_mag, l_prod, l_cat = build_sales_where(filters)
-    loy_joins = sales_joins_sql(l_mag, l_prod, l_cat)
     if stores_data.target_available:
-        m_rev_rows = query_all(
-            conn,
-            f"""
-            SELECT substr(b.cand, 1, 7) AS luna, ROUND(SUM(v.valoare_fara_tva), 2) AS rev
-            FROM bonuri b
-            JOIN vanzari v ON v.id_bon = b.id
-            {loy_joins}
-            WHERE {loy_where}
-            GROUP BY 1
-            """,
-            loy_params,
-        )
         tgt_by_month = compute_targets(conn, filters)["by_month"]
         months_with_tgt = [
-            100.0 * float(r["rev"]) / tgt_by_month[r["luna"]]
-            for r in m_rev_rows
-            if tgt_by_month.get(r["luna"], 0) > 0
+            100.0 * monthly_rev_totals.get(luna, 0.0) / tgt_val
+            for luna, tgt_val in sorted(tgt_by_month.items())
+            if tgt_val > 0
         ]
         missed_months = [att for att in months_with_tgt if att < 100.0]
         max_store_att = max(
@@ -359,59 +325,12 @@ def get_alerts(
             )
 
     # 8. Loyalty Program Flat AOV & Dormancy (Medium)
-    loy_row = query_one(
-        conn,
-        f"""
-        SELECT COUNT(DISTINCT CASE WHEN b.id_client IS NOT NULL THEN b.id END) AS card_rec,
-               COUNT(DISTINCT CASE WHEN b.id_client IS NULL THEN b.id END) AS nocard_rec,
-               COALESCE(SUM(CASE WHEN b.id_client IS NOT NULL THEN v.valoare_fara_tva ELSE 0 END), 0) AS card_rev,
-               COALESCE(SUM(CASE WHEN b.id_client IS NULL THEN v.valoare_fara_tva ELSE 0 END), 0) AS nocard_rev,
-               COALESCE(SUM(CASE WHEN b.id_client IS NOT NULL THEN v.profit ELSE 0 END), 0) AS card_prof,
-               COALESCE(SUM(CASE WHEN b.id_client IS NULL THEN v.profit ELSE 0 END), 0) AS nocard_prof
-        FROM bonuri b
-        JOIN vanzari v ON v.id_bon = b.id
-        {loy_joins}
-        WHERE {loy_where}
-        """,
-        loy_params,
+    aov_diff = abs(cust_data.penetration.card_aov_ron - cust_data.penetration.nocard_aov_ron)
+    dormant_pct = (
+        100.0 * cust_data.dormant_members / cust_data.total_registered_members
+        if cust_data.total_registered_members
+        else 0.0
     )
-    c_rec = int(loy_row["card_rec"])
-    n_rec = int(loy_row["nocard_rec"])
-    c_rev = float(loy_row["card_rev"])
-    n_rev = float(loy_row["nocard_rev"])
-    card_aov = c_rev / c_rec if c_rec else 0.0
-    nocard_aov = n_rev / n_rec if n_rec else 0.0
-    card_mgn = 100.0 * float(loy_row["card_prof"]) / c_rev if c_rev else 0.0
-    nocard_mgn = 100.0 * float(loy_row["nocard_prof"]) / n_rev if n_rev else 0.0
-    card_share = 100.0 * c_rec / (c_rec + n_rec) if (c_rec + n_rec) else 0.0
-
-    client_reg_where = "WHERE c_reg.id_regiune = :region_id" if filters.region_id is not None else ""
-    dorm_row = query_one(
-        conn,
-        f"""
-        WITH v_cnt AS (
-            SELECT b.id_client, COUNT(DISTINCT b.id) AS visits
-            FROM bonuri b
-            JOIN vanzari v ON v.id_bon = b.id
-            {loy_joins}
-            WHERE b.id_client IS NOT NULL AND ({loy_where})
-            GROUP BY b.id_client
-        )
-        SELECT COUNT(*) AS total_members,
-               SUM(CASE WHEN COALESCE(v_cnt.visits, 0) = 0 THEN 1 ELSE 0 END) AS dormant,
-               SUM(CASE WHEN v_cnt.visits = 1 THEN 1 ELSE 0 END) AS one_time
-        FROM clienti c_reg
-        LEFT JOIN v_cnt ON v_cnt.id_client = c_reg.id
-        {client_reg_where}
-        """,
-        loy_params,
-    )
-    total_members = int(dorm_row["total_members"]) if dorm_row else 0
-    dormant_members = int(dorm_row["dormant"] or 0) if dorm_row else 0
-    one_time_members = int(dorm_row["one_time"] or 0) if dorm_row else 0
-    aov_diff = abs(card_aov - nocard_aov)
-    dormant_pct = 100.0 * dormant_members / total_members if total_members else 0.0
-
     if aov_diff < 3.0 or dormant_pct >= 4.0:
         alerts.append(
             AlertItem(
@@ -420,16 +339,16 @@ def get_alerts(
                 category="loyalty",
                 title="Loyalty Program Shows Zero Basket-Size Uplift & Dormant Cohort",
                 metric_highlight=(
-                    f"{card_aov:.2f} vs {nocard_aov:.2f} RON AOV | "
-                    f"{dormant_members:,} dormant"
+                    f"{cust_data.penetration.card_aov_ron:.2f} vs {cust_data.penetration.nocard_aov_ron:.2f} RON AOV | "
+                    f"{cust_data.dormant_members:,} dormant"
                 ),
-                ron_impact=round(dormant_members * card_aov, 2),
-                affected_entities=[f"{dormant_members:,} Dormant Members", f"{one_time_members:,} One-Time Buyers"],
+                ron_impact=round(cust_data.dormant_members * cust_data.penetration.card_aov_ron, 2),
+                affected_entities=[f"{cust_data.dormant_members:,} Dormant Members", f"{cust_data.one_time_members:,} One-Time Buyers"],
                 evidence=(
-                    f"Loyalty cards cover {card_share:.1f}% of receipts, yet card AOV "
-                    f"({card_aov:.2f} RON) and margin ({card_mgn:.2f}%) "
-                    f"are virtually identical to non-card shoppers ({nocard_aov:.2f} RON, "
-                    f"{nocard_mgn:.2f}%). {dormant_members:,} enrolled members "
+                    f"Loyalty cards cover {cust_data.penetration.card_receipt_share_pct:.1f}% of receipts, yet card AOV "
+                    f"({cust_data.penetration.card_aov_ron:.2f} RON) and margin ({cust_data.penetration.card_margin_pct:.2f}%) "
+                    f"are virtually identical to non-card shoppers ({cust_data.penetration.nocard_aov_ron:.2f} RON, "
+                    f"{cust_data.penetration.nocard_margin_pct:.2f}%). {cust_data.dormant_members:,} enrolled members "
                     f"({dormant_pct:.1f}%) recorded 0 visits."
                 ),
                 recommended_action=(
@@ -462,24 +381,42 @@ def get_alerts(
             )
         )
 
-    if severity is not None:
-        alerts = [a for a in alerts if a.severity == severity]
-    if category is not None:
-        alerts = [a for a in alerts if a.category == category]
-
     alerts.sort(key=lambda a: (SEVERITY_RANK[a.severity], -abs(a.ron_impact)))
+    return alerts
+
+
+@router.get("/alerts", response_model=AlertsResponse)
+def get_alerts(
+    severity: Literal["critical", "high", "medium", "low"] | None = Query(default=None),
+    category: Literal[
+        "store_performance", "promotions", "inventory", "loyalty", "data_hygiene"
+    ]
+    | None = Query(default=None),
+    filters: GlobalFilters = Depends(get_global_filters),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AlertsResponse:
+    all_alerts = cached_call(
+        make_cache_key("alerts_all", filters),
+        lambda: _compute_all_alerts(filters, conn),
+    )
+
+    filtered = all_alerts
+    if severity is not None:
+        filtered = [a for a in filtered if a.severity == severity]
+    if category is not None:
+        filtered = [a for a in filtered if a.category == category]
 
     counts = AlertCounts(
-        critical=sum(1 for a in alerts if a.severity == "critical"),
-        high=sum(1 for a in alerts if a.severity == "high"),
-        medium=sum(1 for a in alerts if a.severity == "medium"),
-        low=sum(1 for a in alerts if a.severity == "low"),
+        critical=sum(1 for a in filtered if a.severity == "critical"),
+        high=sum(1 for a in filtered if a.severity == "high"),
+        medium=sum(1 for a in filtered if a.severity == "medium"),
+        low=sum(1 for a in filtered if a.severity == "low"),
     )
-    total_impact = round(sum(a.ron_impact for a in alerts), 2)
+    total_impact = round(sum(a.ron_impact for a in filtered), 2)
 
     return AlertsResponse(
         currency=settings.currency_label,
         counts=counts,
         total_quantified_impact_ron=total_impact,
-        alerts=alerts,
+        alerts=filtered,
     )

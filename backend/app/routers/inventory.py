@@ -18,6 +18,7 @@ from ..schemas import (
     StoreCadenceItem,
     TransferSuggestion,
 )
+from ..services.cache import cached_call, make_cache_key
 from ..services.filters import (
     OPEN_STORE_SQL,
     GlobalFilters,
@@ -55,7 +56,28 @@ def get_inventory(
     filters: GlobalFilters = Depends(get_global_filters),
     conn: sqlite3.Connection = Depends(get_db),
 ) -> InventoryResponse:
-    snap_row = query_one(conn, "SELECT MAX(substr(cand, 1, 10)) AS snap FROM bonuri")
+    def _compute() -> InventoryResponse:
+        return _compute_inventory(low_stock_max, limit, filters, conn)
+
+    return cached_call(
+        make_cache_key(
+            "inventory",
+            filters,
+            ignore_dates=True,
+            low_stock_max=low_stock_max,
+            limit=limit,
+        ),
+        _compute,
+    )
+
+
+def _compute_inventory(
+    low_stock_max: int,
+    limit: int,
+    filters: GlobalFilters,
+    conn: sqlite3.Connection,
+) -> InventoryResponse:
+    snap_row = query_one(conn, "SELECT substr(cand, 1, 10) AS snap FROM bonuri ORDER BY cand DESC LIMIT 1")
     snapshot_str = snap_row["snap"] if snap_row and snap_row["snap"] else settings.default_end_date
     snapshot_dt = date.fromisoformat(snapshot_str)
     vel_start_dt = snapshot_dt - timedelta(days=89)

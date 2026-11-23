@@ -16,6 +16,7 @@ from ..schemas import (
     PromotionsSummary,
     YoYCampaignComparison,
 )
+from ..services.cache import cached_call, make_cache_key
 from ..services.filters import (
     TEST_PROMO_EXCLUDE_SQL,
     GlobalFilters,
@@ -41,6 +42,16 @@ def _verdict(
 def get_promotions(
     filters: GlobalFilters = Depends(get_global_filters),
     conn: sqlite3.Connection = Depends(get_db),
+) -> PromotionsResponse:
+    def _compute() -> PromotionsResponse:
+        return _compute_promotions(filters, conn)
+
+    return cached_call(make_cache_key("promotions", filters), _compute)
+
+
+def _compute_promotions(
+    filters: GlobalFilters,
+    conn: sqlite3.Connection,
 ) -> PromotionsResponse:
     where_sql, params, needs_mag, needs_prod, needs_cat = build_sales_where(filters)
     joins_sql = sales_joins_sql(needs_mag, needs_prod, needs_cat)

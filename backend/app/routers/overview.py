@@ -25,6 +25,7 @@ from ..schemas import (
     StoreOption,
     SubcategoryOption,
 )
+from ..services.cache import cached_call, make_cache_key
 from ..services.filters import (
     GlobalFilters,
     build_sales_where,
@@ -49,10 +50,9 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> HealthResponse:
     row = query_one(
         conn,
         """
-        SELECT MIN(substr(cand, 1, 10)) AS d_min,
-               MAX(substr(cand, 1, 10)) AS d_max,
+        SELECT (SELECT substr(cand, 1, 10) FROM bonuri ORDER BY cand ASC LIMIT 1) AS d_min,
+               (SELECT substr(cand, 1, 10) FROM bonuri ORDER BY cand DESC LIMIT 1) AS d_max,
                (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%') AS tables_cnt
-        FROM bonuri
         """,
     )
     return HealthResponse(
@@ -67,50 +67,56 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> HealthResponse:
 
 @router.get("/filters", response_model=FiltersResponse)
 def get_filters(conn: sqlite3.Connection = Depends(get_db)) -> FiltersResponse:
-    bounds = query_one(
-        conn,
-        "SELECT MIN(substr(cand, 1, 10)) AS d_min, MAX(substr(cand, 1, 10)) AS d_max FROM bonuri",
-    )
-    regions = [
-        RegionOption(id=r["id"], nume=r["nume"])
-        for r in query_all(conn, "SELECT id, nume FROM regiuni ORDER BY nume")
-    ]
-    stores = [
-        StoreOption(
-            id=r["id"],
-            nume=r["nume"],
-            oras=r["oras"],
-            id_regiune=r["id_regiune"],
-            deschis_la=r["deschis_la"],
-            inchis_la=r["inchis_la"],
-            status=_store_status(r["deschis_la"], r["inchis_la"]),
-        )
-        for r in query_all(
+    def _compute() -> FiltersResponse:
+        bounds = query_one(
             conn,
-            "SELECT id, nume, oras, id_regiune, deschis_la, inchis_la FROM magazine ORDER BY nume",
+            """
+            SELECT (SELECT substr(cand, 1, 10) FROM bonuri ORDER BY cand ASC LIMIT 1) AS d_min,
+                   (SELECT substr(cand, 1, 10) FROM bonuri ORDER BY cand DESC LIMIT 1) AS d_max
+            """,
         )
-    ]
-
-    cat_rows = query_all(conn, "SELECT id, nume, id_parinte FROM categorii ORDER BY id")
-    l1_map: dict[int, CategoryOption] = {}
-    for r in cat_rows:
-        if r["id_parinte"] is None:
-            l1_map[r["id"]] = CategoryOption(id=r["id"], nume=r["nume"], subcategories=[])
-    for r in cat_rows:
-        parent_id = r["id_parinte"]
-        if parent_id is not None and parent_id in l1_map:
-            l1_map[parent_id].subcategories.append(
-                SubcategoryOption(id=r["id"], nume=r["nume"])
+        regions = [
+            RegionOption(id=r["id"], nume=r["nume"])
+            for r in query_all(conn, "SELECT id, nume FROM regiuni ORDER BY nume")
+        ]
+        stores = [
+            StoreOption(
+                id=r["id"],
+                nume=r["nume"],
+                oras=r["oras"],
+                id_regiune=r["id_regiune"],
+                deschis_la=r["deschis_la"],
+                inchis_la=r["inchis_la"],
+                status=_store_status(r["deschis_la"], r["inchis_la"]),
             )
+            for r in query_all(
+                conn,
+                "SELECT id, nume, oras, id_regiune, deschis_la, inchis_la FROM magazine ORDER BY nume",
+            )
+        ]
 
-    return FiltersResponse(
-        date_min=bounds["d_min"],
-        date_max=bounds["d_max"],
-        currency=settings.currency_label,
-        regions=regions,
-        stores=stores,
-        categories=sorted(l1_map.values(), key=lambda c: c.nume),
-    )
+        cat_rows = query_all(conn, "SELECT id, nume, id_parinte FROM categorii ORDER BY id")
+        l1_map: dict[int, CategoryOption] = {}
+        for r in cat_rows:
+            if r["id_parinte"] is None:
+                l1_map[r["id"]] = CategoryOption(id=r["id"], nume=r["nume"], subcategories=[])
+        for r in cat_rows:
+            parent_id = r["id_parinte"]
+            if parent_id is not None and parent_id in l1_map:
+                l1_map[parent_id].subcategories.append(
+                    SubcategoryOption(id=r["id"], nume=r["nume"])
+                )
+
+        return FiltersResponse(
+            date_min=bounds["d_min"],
+            date_max=bounds["d_max"],
+            currency=settings.currency_label,
+            regions=regions,
+            stores=stores,
+            categories=sorted(l1_map.values(), key=lambda c: c.nume),
+        )
+
+    return cached_call(make_cache_key("filters"), _compute)
 
 
 @router.get("/overview", response_model=OverviewResponse)
@@ -118,6 +124,17 @@ def get_overview(
     granularity: Literal["month", "week"] = Query(default="month"),
     filters: GlobalFilters = Depends(get_global_filters),
     conn: sqlite3.Connection = Depends(get_db),
+) -> OverviewResponse:
+    def _compute() -> OverviewResponse:
+        return _compute_overview(granularity, filters, conn)
+
+    return cached_call(make_cache_key("overview", filters, granularity=granularity), _compute)
+
+
+def _compute_overview(
+    granularity: Literal["month", "week"],
+    filters: GlobalFilters,
+    conn: sqlite3.Connection,
 ) -> OverviewResponse:
     where_sql, params, needs_mag, needs_prod, needs_cat = build_sales_where(filters)
     joins_sql = sales_joins_sql(needs_mag, needs_prod, needs_cat)
@@ -321,30 +338,61 @@ def get_overview(
                 )
             )
 
-    # Products & Category mix in a single scan
-    cat_joins = sales_joins_sql(needs_mag, True, False)
-    prod_rows = query_all(
-        conn,
-        f"""
-        SELECT p.id, p.nume, p.brand, c2.nume AS category, p.activ,
-               COALESCE(c1.id, c2.id) AS l1_id,
-               COALESCE(c1.nume, c2.nume) AS l1_nume,
-               ROUND(SUM(v.valoare_fara_tva), 2) AS rev,
-               ROUND(SUM(v.profit), 2) AS profit,
-               SUM(v.cantitate) AS units,
-               SUM(CASE WHEN v.cantitate < 0 THEN -v.cantitate ELSE 0 END) AS ret_u,
-               SUM(CASE WHEN v.cantitate > 0 THEN v.cantitate ELSE 0 END) AS sold_u
-        FROM bonuri b
-        JOIN vanzari v ON v.id_bon = b.id
-        {cat_joins}
-        JOIN categorii c2 ON c2.id = p.id_categorie
-        LEFT JOIN categorii c1 ON c1.id = c2.id_parinte
-        WHERE {where_sql}
-        GROUP BY p.id
-        ORDER BY rev DESC
-        """,
-        params,
+    # Products & Category mix in a single scan.
+    # When no date-subset/store/region filter applies, aggregate vanzari directly (skips 674k bonuri lookups).
+    no_bonuri_filter = (
+        filters.store_id is None
+        and filters.region_id is None
+        and filters.start_date <= settings.default_start_date
+        and filters.end_date >= settings.default_end_date
     )
+    if no_bonuri_filter:
+        p_where, p_params, _, _, _ = build_sales_where(filters, include_dates=False)
+        prod_rows = query_all(
+            conn,
+            f"""
+            SELECT p.id, p.nume, p.brand, c2.nume AS category, p.activ,
+                   COALESCE(c1.id, c2.id) AS l1_id,
+                   COALESCE(c1.nume, c2.nume) AS l1_nume,
+                   ROUND(SUM(v.valoare_fara_tva), 2) AS rev,
+                   ROUND(SUM(v.profit), 2) AS profit,
+                   SUM(v.cantitate) AS units,
+                   SUM(CASE WHEN v.cantitate < 0 THEN -v.cantitate ELSE 0 END) AS ret_u,
+                   SUM(CASE WHEN v.cantitate > 0 THEN v.cantitate ELSE 0 END) AS sold_u
+            FROM vanzari v
+            JOIN produse p ON p.id = v.id_produs
+            JOIN categorii c2 ON c2.id = p.id_categorie
+            LEFT JOIN categorii c1 ON c1.id = c2.id_parinte
+            WHERE {p_where}
+            GROUP BY p.id
+            ORDER BY rev DESC
+            """,
+            p_params,
+        )
+    else:
+        cat_joins = sales_joins_sql(needs_mag, True, False)
+        prod_rows = query_all(
+            conn,
+            f"""
+            SELECT p.id, p.nume, p.brand, c2.nume AS category, p.activ,
+                   COALESCE(c1.id, c2.id) AS l1_id,
+                   COALESCE(c1.nume, c2.nume) AS l1_nume,
+                   ROUND(SUM(v.valoare_fara_tva), 2) AS rev,
+                   ROUND(SUM(v.profit), 2) AS profit,
+                   SUM(v.cantitate) AS units,
+                   SUM(CASE WHEN v.cantitate < 0 THEN -v.cantitate ELSE 0 END) AS ret_u,
+                   SUM(CASE WHEN v.cantitate > 0 THEN v.cantitate ELSE 0 END) AS sold_u
+            FROM bonuri b
+            JOIN vanzari v ON v.id_bon = b.id
+            {cat_joins}
+            JOIN categorii c2 ON c2.id = p.id_categorie
+            LEFT JOIN categorii c1 ON c1.id = c2.id_parinte
+            WHERE {where_sql}
+            GROUP BY p.id
+            ORDER BY rev DESC
+            """,
+            params,
+        )
     cat_acc: dict[tuple[int, str], dict[str, float | int]] = {}
     all_prods: list[ProductSummaryItem] = []
     for r in prod_rows:

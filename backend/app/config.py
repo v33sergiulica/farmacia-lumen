@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     default_start_date: str = "2025-05-01"
     default_end_date: str = "2026-10-31"
     currency_label: str = "RON (fără TVA)"
+    warm_cache_on_startup: bool = True
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
