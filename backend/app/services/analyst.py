@@ -50,6 +50,8 @@ FORBIDDEN_SQL_KEYWORDS: frozenset[str] = frozenset(
         "SAVEPOINT",
         "RELEASE",
         "LOAD_EXTENSION",
+        "ZEROBLOB",
+        "RANDOMBLOB",
     }
 )
 
@@ -313,11 +315,14 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
             )
         combined = f"{system_prompt}\n\nUSER REQUEST:\n{user_prompt}"
         try:
+            # Pass prompt via stdin with shell=False so user text can never inject CLI flags
             proc = subprocess.run(
-                [exe, "-p", combined],
+                [exe, "-p"],
+                input=combined,
                 capture_output=True,
                 text=True,
                 timeout=45,
+                shell=False,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:

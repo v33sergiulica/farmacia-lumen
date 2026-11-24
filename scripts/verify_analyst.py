@@ -5,6 +5,7 @@ NOTE: Never reads or prints .env or any API key values.
 
 from __future__ import annotations
 
+import argparse
 import sqlite3
 import sys
 import time
@@ -42,6 +43,8 @@ def run_security_and_guardrail_tests() -> None:
         ("Stacked via newline", "SELECT 1 FROM regiuni;\nDROP TABLE magazine;"),
         ("Block comment bypass", "/* ok */ DELETE FROM bonuri"),
         ("Multiple SELECTs", "SELECT 1; SELECT 2"),
+        ("Memory DoS zeroblob", "SELECT zeroblob(1000000000)"),
+        ("Memory DoS randomblob", "SELECT randomblob(1000000000)"),
     ]
 
     for label, bad_sql in malicious_queries:
@@ -174,10 +177,19 @@ def run_live_qa_tests() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Verify AI Analyst security and live Q&A.")
+    parser.add_argument(
+        "--security-only",
+        action="store_true",
+        help="Run only offline SQL security, timeout, and mocked retry tests (no LLM calls).",
+    )
+    args = parser.parse_args()
+
     settings.warm_cache_on_startup = False
     run_security_and_guardrail_tests()
-    run_live_qa_tests()
-    print("\nALL PHASE 5 SECURITY, TIMEOUT & LIVE AI ANALYST CHECKS PASSED.", flush=True)
+    if not args.security_only:
+        run_live_qa_tests()
+    print("\nALL PHASE 5 SECURITY, TIMEOUT & AI ANALYST CHECKS PASSED.", flush=True)
 
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ export function AnalystDrawer({ open, onClose }: AnalystDrawerProps) {
       />
       <aside
         aria-label="Ask Your Data Analyst"
-        className="relative z-10 flex h-full w-full max-w-2xl flex-col border-l border-[#E2E7E4] bg-white transition-transform duration-150"
+        className="relative z-10 flex h-full w-full max-w-3xl flex-col border-l border-[#E2E7E4] bg-white transition-transform duration-150"
       >
         <div className="flex items-center justify-between border-b border-[#E2E7E4] px-5 py-4">
           <div>
@@ -279,7 +279,7 @@ export function AnalystDrawer({ open, onClose }: AnalystDrawerProps) {
               {/* Tabular Preview */}
               {result.rows.length > 0 && (
                 <div className="overflow-x-auto rounded border border-[#E2E7E4] bg-white">
-                  <table className="w-full border-collapse text-left text-xs">
+                  <table className="min-w-full border-collapse text-left text-xs">
                     <thead className="border-b border-[#E2E7E4] bg-[#F6F7F6] text-[#5C6B63]">
                       <tr>
                         {result.columns.map((col) => {
@@ -287,7 +287,7 @@ export function AnalystDrawer({ open, onClose }: AnalystDrawerProps) {
                           return (
                             <th
                               key={col}
-                              className={`px-2.5 py-2 font-medium ${
+                              className={`whitespace-nowrap px-3 py-2 font-medium ${
                                 numericCol ? "text-right" : "text-left"
                               }`}
                             >
@@ -306,7 +306,7 @@ export function AnalystDrawer({ open, onClose }: AnalystDrawerProps) {
                             return (
                               <td
                                 key={col}
-                                className={`tabular px-2.5 py-1.5 text-[#111A16] ${
+                                className={`tabular whitespace-nowrap px-3 py-1.5 text-[#111A16] ${
                                   numeric ? "text-right" : "text-left"
                                 }`}
                               >
