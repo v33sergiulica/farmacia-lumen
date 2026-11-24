@@ -1,17 +1,27 @@
-"""Headless AI Analyst router stub (implemented in Phase 5)."""
+"""Headless AI Analyst router (POST /api/v1/analyst/ask)."""
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from ..schemas import AnalystQuestionRequest
+from ..schemas import AnalystQuestionRequest, AnalystResponse
+from ..services.analyst import (
+    AnalystConfigError,
+    AnalystExecutionError,
+    SqlSecurityError,
+    answer_question,
+)
 
 router = APIRouter(tags=["analyst"])
 
 
-@router.post("/analyst/ask")
-def ask_analyst(_payload: AnalystQuestionRequest) -> dict[str, str]:
-    raise HTTPException(
-        status_code=501,
-        detail="Headless AI Analyst endpoint will be implemented in Phase 5.",
-    )
+@router.post("/analyst/ask", response_model=AnalystResponse)
+def ask_analyst(payload: AnalystQuestionRequest) -> AnalystResponse:
+    try:
+        return answer_question(payload.question, payload.filters)
+    except AnalystConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except SqlSecurityError as exc:
+        raise HTTPException(status_code=400, detail=f"Blocked unsafe SQL: {exc}") from exc
+    except AnalystExecutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

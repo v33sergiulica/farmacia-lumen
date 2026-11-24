@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -443,5 +443,17 @@ class AlertsResponse(BaseModel):
 
 
 class AnalystQuestionRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=3, max_length=600)
     filters: dict[str, str | int | None] | None = None
+
+
+class AnalystResponse(BaseModel):
+    answer: str
+    sql: str
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    row_count: int
+    truncated: bool = False
+    execution_ms: float
+    retries_used: int
+    provider: str

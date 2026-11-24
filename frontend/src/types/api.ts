@@ -463,6 +463,8 @@ export interface AnalystResponse {
   columns: string[];
   rows: Array<Record<string, unknown>>;
   row_count: number;
+  truncated?: boolean;
   execution_ms: number;
   retries_used: number;
+  provider?: string;
 }

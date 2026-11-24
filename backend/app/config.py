@@ -9,7 +9,11 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(ROOT_DIR / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     app_title: str = "Farmacia Lumen BI & Operations API"
     app_version: str = "1.0.0"
@@ -22,6 +26,15 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
+
+    # Headless AI Analyst settings (loaded from .env; never logged)
+    analyst_provider: str = "gemini_api"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_cli_bin: str = "gemini"
+    claude_cli_bin: str = "claude"
+    analyst_max_rows: int = 200
+    analyst_query_timeout_sec: float = 10.0
 
 
 settings = Settings()

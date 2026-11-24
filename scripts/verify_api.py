@@ -188,11 +188,11 @@ def main() -> None:
             assert c_rec[4] == w_rec[4], f"Warm response diverged from cold on {c_rec[0]}"
         print("[PASS] Warm-cache pass matched cold-cache payloads 100%.")
 
-        # Analyst stub check
+        # Analyst endpoint schema validation check (invalid short question returns 422, never 500)
         t0 = time.perf_counter()
-        resp = client.post("/api/v1/analyst/ask", json={"question": "Top 5 stores?"})
+        resp = client.post("/api/v1/analyst/ask", json={"question": "hi"})
         stub_ms = (time.perf_counter() - t0) * 1000.0
-        assert resp.status_code == 501
+        assert resp.status_code == 422
 
     # 3. Verify async startup cache warmup completes cleanly
     response_cache.clear()
@@ -213,7 +213,7 @@ def main() -> None:
     for (lbl, _p, _pr, st, _b, c_ms), (_wl, _wp, _wpr, _wst, _wb, w_ms) in zip(cold, warm, strict=True):
         spd = f"{c_ms / w_ms:.0f}x" if w_ms > 0.05 else ">1000x"
         print(f"  {lbl:<44} {st:>3} {c_ms:>9.1f} {w_ms:>9.1f} {spd:>8}")
-    print(f"  {'POST /api/v1/analyst/ask (stub)':<44} {501:>3} {stub_ms:>9.1f} {'-':>9} {'-':>8}")
+    print(f"  {'POST /api/v1/analyst/ask (422 guard)':<44} {422:>3} {stub_ms:>9.1f} {'-':>9} {'-':>8}")
     print(f"\nCache stats: {response_cache.stats()}")
     print("ALL PHASE 3 OPTIMIZED CHECKS PASSED WITH ZERO 500 ERRORS.")
 
