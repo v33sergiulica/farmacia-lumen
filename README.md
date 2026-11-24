@@ -6,6 +6,12 @@ Built with an **Apothecary Executive BI** visual system (clean alabaster canvas,
 
 ---
 
+### Challenge Deliverables
+- **Application & Data Pipeline:** `/backend`, `/frontend`, `/scripts` (quickstart below)
+- **AI Harness Conversation Log:** [`docs/harness_conversation.md`](docs/harness_conversation.md)
+- **Reflection & Next Steps:** [Future Improvements](#future-improvements)
+
+
 ## Architecture
 
 ```text
@@ -145,8 +151,6 @@ cd frontend && npm.cmd run build
 | `GET /api/v1/alerts` (dynamic SQL) | 304.6 ms | **4.9 ms** |
 
 ---
-
-## Future Improvements
 
 ## Future Improvements
 
