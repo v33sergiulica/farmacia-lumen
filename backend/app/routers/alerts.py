@@ -72,23 +72,36 @@ def _compute_all_alerts(filters: GlobalFilters, conn: sqlite3.Connection) -> lis
             m_rows = by_store_months.get(st.id, [])
             inflection_note = ""
             if len(m_rows) >= 6:
-                for idx in range(2, len(m_rows) - 2):
-                    pre = [
-                        100.0 * float(r["rev"]) / store_month_targets[(st.id, str(r["luna"]))]
-                        for r in m_rows[:idx]
-                        if store_month_targets.get((st.id, str(r["luna"])), 0.0) > 0
-                    ]
-                    post = [
-                        100.0 * float(r["rev"]) / store_month_targets[(st.id, str(r["luna"]))]
-                        for r in m_rows[idx:]
-                        if store_month_targets.get((st.id, str(r["luna"])), 0.0) > 0
-                    ]
-                    if pre and post and (sum(pre) / len(pre)) >= 90.0 and (sum(post) / len(post)) < 75.0:
-                        inflection_note = (
-                            f" Performance dropped abruptly from {sum(pre)/len(pre):.1f}% avg attainment "
-                            f"to {sum(post)/len(post):.1f}% starting {m_rows[idx]['luna']}."
-                        )
-                        break
+                atts = [
+                    (
+                        str(r["luna"]),
+                        100.0 * float(r["rev"]) / store_month_targets[(st.id, str(r["luna"]))],
+                    )
+                    for r in m_rows
+                    if store_month_targets.get((st.id, str(r["luna"])), 0.0) > 0
+                ]
+                best_break: tuple[float, str, float, float] | None = None
+                for idx in range(2, len(atts) - 2):
+                    pre_vals = [a for _, a in atts[:idx]]
+                    post_vals = [a for _, a in atts[idx:]]
+                    avg_pre = sum(pre_vals) / len(pre_vals)
+                    avg_post = sum(post_vals) / len(post_vals)
+                    # Require true step-down at idx (previous month healthy, current month dropped)
+                    if (
+                        avg_pre >= 90.0
+                        and avg_post < 75.0
+                        and atts[idx - 1][1] >= 85.0
+                        and atts[idx][1] < 80.0
+                    ):
+                        gap = avg_pre - avg_post
+                        if best_break is None or gap > best_break[0]:
+                            best_break = (gap, atts[idx][0], avg_pre, avg_post)
+                if best_break is not None:
+                    _, break_month, avg_pre, avg_post = best_break
+                    inflection_note = (
+                        f" Performance dropped abruptly from {avg_pre:.1f}% avg attainment "
+                        f"to {avg_post:.1f}% starting {break_month}."
+                    )
 
             share_shortfall = (
                 abs(st.variance_ron) / abs(total_chain_shortfall) * 100.0
@@ -170,19 +183,29 @@ def _compute_all_alerts(filters: GlobalFilters, conn: sqlite3.Connection) -> lis
     # 3 & 4. Net-Loss and Margin-Eroding Promotions
     for c in promos_data.campaigns:
         if c.verdict == "net_loss":
+            # Use non-overlapping below-cost line loss (fallback to abs net profit loss if 0)
+            below_cost_impact = (
+                round(abs(c.below_cost_loss_ron), 2)
+                if c.below_cost_loss_ron < 0
+                else round(abs(c.profit_ron), 2)
+            )
             alerts.append(
                 AlertItem(
                     id=f"promo-loss-{c.id}",
                     severity="critical",
                     category="promotions",
                     title=f"Net-Loss Promotion: {c.nume}",
-                    metric_highlight=f"{c.profit_ron:,.0f} RON profit ({c.margin_pct:.1f}% margin)",
-                    ron_impact=round(abs(c.below_cost_loss_ron) + abs(c.profit_ron), 2),
+                    metric_highlight=(
+                        f"{c.profit_ron:,.0f} RON net profit ({c.margin_pct:.1f}% margin) | "
+                        f"{abs(c.below_cost_loss_ron):,.0f} RON below-cost loss"
+                    ),
+                    ron_impact=below_cost_impact,
                     affected_entities=[c.nume],
                     evidence=(
                         f"'{c.nume}' ({c.tip}) generated {c.revenue_ron:,.0f} RON revenue after {c.discount_ron:,.0f} RON "
-                        f"in discounts, resulting in {c.profit_ron:,.0f} RON net profit ({c.margin_pct:.1f}% margin) "
-                        f"and {c.below_cost_lines:,} positive-qty below-cost lines ({c.below_cost_loss_ron:,.0f} RON loss)."
+                        f"in discounts, resulting in {c.profit_ron:,.0f} RON net profit ({c.margin_pct:.1f}% margin). "
+                        f"Impact reflects the {abs(c.below_cost_loss_ron):,.0f} RON gross loss across "
+                        f"{c.below_cost_lines:,} positive-qty below-cost lines."
                     ),
                     recommended_action=(
                         "Retire unconditional 2+1 mechanics on sub-33% margin SKUs; replace with "

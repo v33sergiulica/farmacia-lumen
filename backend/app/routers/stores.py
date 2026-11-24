@@ -446,21 +446,36 @@ def get_store_trend(
                 )
 
         if granularity == "month" and len(series) >= 6:
-            for idx in range(2, len(series) - 2):
-                prev_att = [p.attainment_pct for p in series[:idx] if p.attainment_pct is not None]
-                next_att = [p.attainment_pct for p in series[idx:] if p.attainment_pct is not None]
-                if prev_att and next_att:
-                    avg_before = sum(prev_att) / len(prev_att)
-                    avg_after = sum(next_att) / len(next_att)
-                    if avg_before >= 90.0 and avg_after < 75.0 and (avg_before - avg_after) >= 20.0:
-                        events.append(
-                            StoreEvent(
-                                date=series[idx].period,
-                                title="Sustained Revenue Step-Down",
-                                impact_summary=f"Attainment shifted from {avg_before:.1f}% avg before {series[idx].period} to {avg_after:.1f}% after.",
-                            )
-                        )
-                        break
+            atts = [
+                (p.period, p.attainment_pct)
+                for p in series
+                if p.attainment_pct is not None
+            ]
+            best_break: tuple[float, str, float, float] | None = None
+            for idx in range(2, len(atts) - 2):
+                prev_att = [a for _, a in atts[:idx]]
+                next_att = [a for _, a in atts[idx:]]
+                avg_before = sum(prev_att) / len(prev_att)
+                avg_after = sum(next_att) / len(next_att)
+                if (
+                    avg_before >= 90.0
+                    and avg_after < 75.0
+                    and (avg_before - avg_after) >= 20.0
+                    and atts[idx - 1][1] >= 85.0
+                    and atts[idx][1] < 80.0
+                ):
+                    gap = avg_before - avg_after
+                    if best_break is None or gap > best_break[0]:
+                        best_break = (gap, atts[idx][0], avg_before, avg_after)
+            if best_break is not None:
+                _, break_period, avg_before, avg_after = best_break
+                events.append(
+                    StoreEvent(
+                        date=break_period,
+                        title="Sustained Revenue Step-Down",
+                        impact_summary=f"Attainment shifted from {avg_before:.1f}% avg before {break_period} to {avg_after:.1f}% after.",
+                    )
+                )
 
         transfers: list[StoreTransferSummary] = []
         tr_rows = query_all(

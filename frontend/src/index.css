@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+:root {
+  --bg-canvas: #f6f7f6;
+  --bg-surface: #ffffff;
+  --border-hairline: #e2e7e4;
+  --ink-primary: #111a16;
+  --ink-secondary: #46544d;
+  --ink-muted: #5c6b63;
+  --accent-primary: #146c43;
+  --accent-hover: #0f5132;
+  --accent-tint: #ecf6f0;
+  --accent-border: #b7dfc9;
+  --signal-crimson: #b42318;
+  --signal-crimson-tint: #fef3f2;
+  --signal-crimson-border: #fecdca;
+  --signal-amber: #b54708;
+  --signal-amber-tint: #fffaeb;
+  --signal-amber-border: #fedf89;
+  --series-slate: #94a3b8;
+}
+
+@layer base {
+  html,
+  body {
+    background-color: var(--bg-canvas);
+    color: var(--ink-primary);
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono-data {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.text-balance {
+  text-wrap: balance;
+}
+
+@keyframes top-progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+.animate-top-progress {
+  animation: top-progress-slide 1.1s ease-in-out infinite;
+}

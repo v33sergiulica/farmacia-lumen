@@ -120,7 +120,7 @@ def run_pass(client: TestClient, verify_invariants: bool) -> list[tuple[str, str
         assert s18["status"] == "opened_mid_period" and s18["active_months"] == 8
         assert stores_cat["target_available"] is False
         assert t9["sibling_comparison"] is not None and t9["sibling_comparison"]["store_id"] == 10
-        assert any("Step-Down" in e["title"] for e in t9["events"])
+        assert any("Step-Down" in e["title"] and e["date"] == "2025-11" for e in t9["events"])
         assert any("22-Day" in e["title"] for e in t11["events"])
         assert len(t16["transfers"]) == 3
 
@@ -151,6 +151,10 @@ def run_pass(client: TestClient, verify_invariants: bool) -> list[tuple[str, str
         assert al["counts"]["critical"] >= 2 and al["counts"]["high"] >= 3
         assert al["counts"]["medium"] >= 2 and al["counts"]["low"] >= 1
         assert all(a["severity"] == "critical" for a in al_f["alerts"])
+        s9_alert = next(a for a in al["alerts"] if a["id"] == "store-underperf-9")
+        assert "starting 2025-11" in s9_alert["evidence"], f"Unexpected Store 9 inflection: {s9_alert['evidence']}"
+        somn_alert = next(a for a in al["alerts"] if a["id"] == "promo-loss-9")
+        assert somn_alert["ron_impact"] < 7000, f"Double-counted Somn impact: {somn_alert['ron_impact']}"
 
     return records
 
